@@ -11,6 +11,8 @@ const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
+const WeakRef = @import("../weak_ref.zig").WeakRef;
+const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const SplitTree = @import("split_tree.zig").SplitTree;
@@ -157,6 +159,9 @@ pub const Tab = extern struct {
     };
 
     const Private = struct {
+        id: u64 = 0,
+        close_dialog: WeakRef(CloseConfirmationDialog) = .empty,
+
         /// The configuration that this surface is using.
         config: ?*Config = null,
 
@@ -189,9 +194,35 @@ pub const Tab = extern struct {
     }
 
     pub fn new(config: ?*Config, overrides: Overrides) *Self {
+        const tab = create(config);
+
+        tab.private().split_tree.newSplit(.right, null, .{
+            .command = overrides.command,
+            .shell_integration = overrides.shell_integration,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => @panic("oom"),
+        };
+
+        return tab;
+    }
+
+    pub fn newFromSurface(config: ?*Config, surface: *Surface) *Self {
+        const tab = create(config);
+        const split_tree = tab.private().split_tree;
+        surface.bindIsSplit(split_tree);
+        var tree = Surface.Tree.init(Application.default().allocator(), surface) catch @panic("oom");
+        defer tree.deinit();
+        split_tree.setTree(&tree);
+        return tab;
+    }
+
+    fn create(config: ?*Config) *Self {
         const tab = gobject.ext.newInstance(Tab, .{});
 
         const priv: *Private = tab.private();
+        priv.id = Application.default().nextTabId();
 
         if (config) |c| priv.config = c.ref();
 
@@ -204,22 +235,19 @@ pub const Tab = extern struct {
 
         tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
-        // Create our initial surface in the split tree.
-        priv.split_tree.newSplit(.right, null, .{
-            .command = overrides.command,
-            .shell_integration = overrides.shell_integration,
-            .working_directory = overrides.working_directory,
-            .title = overrides.title,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => {
-                // TODO: We should make our "no surfaces" state more aesthetically
-                // pleasing and show something like an "Oops, something went wrong"
-                // message. For now, this is incredibly unlikely.
-                @panic("oom");
-            },
-        };
-
         return tab;
+    }
+
+    pub fn getId(self: *Self) u64 {
+        return self.private().id;
+    }
+
+    pub fn setCloseDialog(self: *Self, dialog: ?*CloseConfirmationDialog) void {
+        self.private().close_dialog.set(dialog);
+    }
+
+    pub fn getCloseDialog(self: *Self) ?*CloseConfirmationDialog {
+        return self.private().close_dialog.get();
     }
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
@@ -296,6 +324,10 @@ pub const Tab = extern struct {
         return priv.split_tree;
     }
 
+    pub fn requestClose(self: *Self) void {
+        signals.@"close-request".impl.emit(self, null, .{}, null);
+    }
+
     /// Returns true if this tab needs confirmation before quitting based
     /// on the various Ghostty configurations.
     pub fn getNeedsConfirmQuit(self: *Self) bool {
@@ -322,6 +354,7 @@ pub const Tab = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.close_dialog.deinit();
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -371,12 +404,7 @@ pub const Tab = extern struct {
         // If our tree is empty we close the tab.
         const tree: *const Surface.Tree = self.getSurfaceTree() orelse &.empty;
         if (tree.isEmpty()) {
-            signals.@"close-request".impl.emit(
-                self,
-                null,
-                .{},
-                null,
-            );
+            self.requestClose();
             return;
         }
     }

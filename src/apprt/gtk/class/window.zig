@@ -278,6 +278,8 @@ pub const Window = extern struct {
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
 
+        confirmed_close_tab: ?*Tab = null,
+
         /// The manually overridden title.
         title_override: ?[:0]const u8 = null,
 
@@ -1656,10 +1658,28 @@ pub const Window = extern struct {
         Application.default().retainClosedTab(self, page);
     }
 
+    pub fn closeConfirmedTab(self: *Self, tab: *Tab) void {
+        const tab_view = self.private().tab_view;
+        const page = tab_view.getPage(tab.as(gtk.Widget));
+        if (tab.getCloseDialog()) |dialog| {
+            tab.setCloseDialog(null);
+            tab_view.closePageFinish(page, @intFromBool(false));
+            dialog.close();
+            dialog.unref();
+        }
+        self.private().confirmed_close_tab = tab;
+        tab_view.closePage(page);
+    }
+
     fn closeConfirmationCloseTab(
-        _: *CloseConfirmationDialog,
+        dialog: *CloseConfirmationDialog,
         page: *adw.TabPage,
     ) callconv(.c) void {
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+        const pending = tab.getCloseDialog() orelse return;
+        defer pending.unref();
+        if (pending != dialog) return;
+        tab.setCloseDialog(null);
         const tab_view = ext.getAncestor(
             adw.TabView,
             page.getChild().as(gtk.Widget),
@@ -1674,9 +1694,14 @@ pub const Window = extern struct {
     }
 
     fn closeConfirmationCancelTab(
-        _: *CloseConfirmationDialog,
+        dialog: *CloseConfirmationDialog,
         page: *adw.TabPage,
     ) callconv(.c) void {
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+        const pending = tab.getCloseDialog() orelse return;
+        defer pending.unref();
+        if (pending != dialog) return;
+        tab.setCloseDialog(null);
         const tab_view = ext.getAncestor(
             adw.TabView,
             page.getChild().as(gtk.Widget),
@@ -1696,6 +1721,13 @@ pub const Window = extern struct {
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse
             return @intFromBool(false);
+
+        if (priv.confirmed_close_tab == tab) {
+            priv.confirmed_close_tab = null;
+            self.retainClosedTab(page);
+            priv.tab_view.closePageFinish(page, @intFromBool(true));
+            return @intFromBool(true);
+        }
 
         // If the tab says it doesn't need confirmation then we go ahead
         // and close immediately.
@@ -1724,6 +1756,7 @@ pub const Window = extern struct {
             page,
             .{},
         );
+        tab.setCloseDialog(dialog);
 
         // Show it
         dialog.present(child);

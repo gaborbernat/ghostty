@@ -17,6 +17,8 @@ const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const Surface = @import("surface.zig").Surface;
 const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScrolledWindow;
+const Tab = @import("tab.zig").Tab;
+const Window = @import("window.zig").Window;
 const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_split_tree);
@@ -166,9 +168,8 @@ pub const SplitTree = extern struct {
         /// once it is mapped again.
         restore_focus_source: ?c_uint = null,
 
-        /// Used to store state about a pending surface close for the
-        /// close dialog.
-        pending_close: ?Surface.Tree.Node.Handle,
+        pending_close: WeakRef(Surface) = .empty,
+        pending_dialog: WeakRef(CloseConfirmationDialog) = .empty,
 
         pub var offset: c_int = 0;
     };
@@ -178,10 +179,6 @@ pub const SplitTree = extern struct {
 
         // Initialize our actions
         self.initActionMap();
-
-        // Initialize some basic state
-        const priv = self.private();
-        priv.pending_close = null;
     }
 
     fn initActionMap(self: *Self) void {
@@ -274,6 +271,32 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+    }
+
+    pub fn restoreClosedSplit(
+        self: *Self,
+        surface: *Surface,
+        anchor: *Surface,
+        sibling_end: ?*Surface,
+        direction: Surface.Tree.Split.Direction,
+        ratio: f16,
+    ) Allocator.Error!bool {
+        const alloc = Application.default().allocator();
+        const old_tree = self.getTree() orelse return false;
+        const handle = old_tree.locate(anchor) orelse return false;
+        const target = if (sibling_end) |v|
+            if (old_tree.locate(v)) |end| commonSubtree(old_tree, handle, end) else handle
+        else
+            handle;
+        var single_tree = try Surface.Tree.init(alloc, surface);
+        defer single_tree.deinit();
+        var new_tree = try old_tree.split(alloc, target, direction, ratio, &single_tree);
+        defer new_tree.deinit();
+        surface.bindIsSplit(self);
+        self.private().last_focused.set(surface);
+        self.setTree(&new_tree);
+        surface.grabFocus();
+        return true;
     }
 
     pub fn resize(
@@ -642,6 +665,8 @@ pub const SplitTree = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.last_focused.deinit();
+        priv.pending_close.deinit();
+        priv.pending_dialog.deinit();
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove rebuild source", .{});
@@ -760,27 +785,41 @@ pub const SplitTree = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const core = surface.core() orelse return;
-
-        // Reset our pending close state
         const priv = self.private();
-        priv.pending_close = null;
-
-        // Find the surface in the tree to verify this is valid and
-        // set our pending close handle.
         const tree = self.getTree() orelse return;
-        priv.pending_close = tree.locate(surface) orelse return;
-
-        // If we don't need to confirm then just close immediately.
-        if (!core.needsConfirmQuit()) {
-            closeConfirmationClose(
-                null,
-                self,
-            );
+        _ = tree.locate(surface) orelse return;
+        const needs_confirm = core.needsConfirmQuit();
+        if (!needs_confirm) {
+            if (priv.pending_close.get()) |pending| {
+                defer pending.unref();
+                if (pending == surface) {
+                    priv.pending_close.set(null);
+                    if (priv.pending_dialog.get()) |dialog| {
+                        priv.pending_dialog.set(null);
+                        dialog.close();
+                        dialog.unref();
+                    }
+                }
+            }
+        } else if (priv.pending_close.get()) |pending| {
+            pending.unref();
             return;
         }
+        if (!tree.isSplit()) {
+            if (ext.getAncestor(Tab, self.as(gtk.Widget))) |tab| tab.requestClose();
+            return;
+        }
+        if (!needs_confirm) {
+            self.closeSurface(surface);
+            return;
+        }
+        priv.pending_close.set(surface);
 
         // Show a confirmation dialog
-        const dialog: *CloseConfirmationDialog = .new(.surface);
+        const dialog: *CloseConfirmationDialog = .new(if (Application.default().undoEnabled())
+            .surface_undoable
+        else
+            .surface);
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
             *Self,
@@ -788,22 +827,49 @@ pub const SplitTree = extern struct {
             self,
             .{},
         );
+        _ = CloseConfirmationDialog.signals.cancel.connect(
+            dialog,
+            *Self,
+            closeConfirmationCancel,
+            self,
+            .{},
+        );
+        priv.pending_dialog.set(dialog);
         dialog.present(self.as(gtk.Widget));
+    }
+
+    fn closeConfirmationCancel(_: *CloseConfirmationDialog, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        priv.pending_close.set(null);
+        priv.pending_dialog.set(null);
     }
 
     fn closeConfirmationClose(
         _: ?*CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
-        // Get the handle we're closing
         const priv = self.private();
-        const handle = priv.pending_close orelse return;
-        priv.pending_close = null;
+        const surface = priv.pending_close.get() orelse return;
+        defer surface.unref();
+        priv.pending_close.set(null);
+        priv.pending_dialog.set(null);
+        self.closeSurface(surface);
+    }
+
+    fn closeSurface(self: *Self, surface: *Surface) void {
+        const priv = self.private();
+        const old_tree = self.getTree() orelse return;
+        const handle = old_tree.locate(surface) orelse return;
+        if (!old_tree.isSplit()) {
+            const tab = ext.getAncestor(Tab, self.as(gtk.Widget)) orelse return;
+            const window = ext.getAncestor(Window, self.as(gtk.Widget)) orelse return;
+            window.closeConfirmedTab(tab);
+            return;
+        }
 
         // Figure out our next focus target. The next focus target is
         // always the "previous" surface unless we're the leftmost then
         // its the next.
-        const old_tree = self.getTree() orelse return;
         const next_focus: ?*Surface = next_focus: {
             const alloc = Application.default().allocator();
             const next_handle: Surface.Tree.Node.Handle =
@@ -818,6 +884,8 @@ pub const SplitTree = extern struct {
             break :next_focus old_tree.nodes[next_handle.idx()].leaf;
         };
 
+        const placement = restorePlacement(old_tree, handle);
+
         // Remove it from the tree.
         var new_tree = old_tree.remove(
             Application.default().allocator(),
@@ -827,11 +895,97 @@ pub const SplitTree = extern struct {
             return;
         };
         defer new_tree.deinit();
-        self.setTree(&new_tree);
-
-        // Grab focus. We have to set this on the "last focused" because our
-        // focus will be set when the tree is redrawn.
+        if (placement) |value| {
+            Application.default().retainClosedSplit(
+                self,
+                surface,
+                value.anchor,
+                value.sibling_end,
+                value.direction,
+                value.ratio,
+            );
+        }
         if (next_focus) |v| priv.last_focused.set(v);
+        self.setTree(&new_tree);
+    }
+
+    const RestorePlacement = struct {
+        anchor: *Surface,
+        sibling_end: *Surface,
+        direction: Surface.Tree.Split.Direction,
+        ratio: f16,
+    };
+
+    fn restorePlacement(tree: *const Surface.Tree, handle: Surface.Tree.Node.Handle) ?RestorePlacement {
+        for (tree.nodes) |node| {
+            const split = switch (node) {
+                .split => |value| value,
+                .leaf => continue,
+            };
+            const removed_left = split.left == handle;
+            if (!removed_left and split.right != handle) continue;
+            const sibling = if (removed_left) split.right else split.left;
+            var first = sibling;
+            while (true) {
+                switch (tree.nodes[first.idx()]) {
+                    .leaf => |anchor| return .{
+                        .anchor = anchor,
+                        .sibling_end = lastLeaf(tree, sibling),
+                        .direction = switch (split.layout) {
+                            .horizontal => if (removed_left) .left else .right,
+                            .vertical => if (removed_left) .up else .down,
+                        },
+                        .ratio = split.ratio,
+                    },
+                    .split => |nested| first = nested.left,
+                }
+            }
+        }
+        return null;
+    }
+
+    fn lastLeaf(tree: *const Surface.Tree, root: Surface.Tree.Node.Handle) *Surface {
+        var handle = root;
+        while (true) {
+            switch (tree.nodes[handle.idx()]) {
+                .leaf => |surface| return surface,
+                .split => |split| handle = split.right,
+            }
+        }
+    }
+
+    fn commonSubtree(
+        tree: *const Surface.Tree,
+        first: Surface.Tree.Node.Handle,
+        last: Surface.Tree.Node.Handle,
+    ) Surface.Tree.Node.Handle {
+        var handle: Surface.Tree.Node.Handle = .root;
+        while (true) {
+            const split = switch (tree.nodes[handle.idx()]) {
+                .split => |value| value,
+                .leaf => return handle,
+            };
+            if (subtreeContains(tree, split.left, first) and subtreeContains(tree, split.left, last)) {
+                handle = split.left;
+            } else if (subtreeContains(tree, split.right, first) and subtreeContains(tree, split.right, last)) {
+                handle = split.right;
+            } else {
+                return handle;
+            }
+        }
+    }
+
+    fn subtreeContains(
+        tree: *const Surface.Tree,
+        root: Surface.Tree.Node.Handle,
+        target: Surface.Tree.Node.Handle,
+    ) bool {
+        if (root == target) return true;
+        return switch (tree.nodes[root.idx()]) {
+            .leaf => false,
+            .split => |split| subtreeContains(tree, split.left, target) or
+                subtreeContains(tree, split.right, target),
+        };
     }
 
     fn propSurfaceFocused(
