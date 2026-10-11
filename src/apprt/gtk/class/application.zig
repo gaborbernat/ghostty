@@ -790,6 +790,13 @@ pub const Application = extern struct {
             .toggle_maximize => Action.toggleMaximize(target),
             .toggle_fullscreen => Action.toggleFullscreen(target),
             .toggle_quick_terminal => return Action.toggleQuickTerminal(self),
+            .toggle_background_opacity => return switch (target) {
+                .app => false,
+                .surface => |surface_core| (ext.getAncestor(
+                    Window,
+                    surface_core.rt_surface.surface.as(gtk.Widget),
+                ) orelse return false).toggleBackgroundOpacity(),
+            },
             .toggle_tab_overview => return Action.toggleTabOverview(target),
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
@@ -808,7 +815,6 @@ pub const Application = extern struct {
             .close_all_windows,
             .float_window,
             .toggle_visibility,
-            .toggle_background_opacity,
             .cell_size,
             .render_inspector,
             .renderer_health,
@@ -1754,6 +1760,12 @@ pub const Application = extern struct {
         action: *const Binding.Action,
         self: *Self,
     ) callconv(.c) void {
+        if (action.* == .toggle_background_opacity) {
+            const gtk_window = self.as(gtk.Application).getActiveWindow() orelse return;
+            const window = gobject.ext.cast(Window, gtk_window) orelse return;
+            _ = window.toggleBackgroundOpacity();
+            return;
+        }
         self.core().performAllAction(self.rt(), action.*) catch |err| {
             log.warn("failed to perform action={}", .{err});
         };

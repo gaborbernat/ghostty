@@ -403,6 +403,8 @@ fn drainMailbox(self: *Thread) !void {
 
             .resize => |v| self.renderer.setScreenSize(v),
 
+            .background_opaque => |v| self.renderer.setBackgroundOpaque(v),
+
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
                 defer config.alloc.destroy(config.impl);
