@@ -179,13 +179,14 @@ pub const Target = enum(c_int) {
     tab_undoable,
     window,
     surface,
+    surface_undoable,
 
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .app => i18n._("Quit Ghostty?"),
             .tab, .tab_undoable => i18n._("Close Tab?"),
             .window => i18n._("Close Window?"),
-            .surface => i18n._("Close Split?"),
+            .surface, .surface_undoable => i18n._("Close Split?"),
         };
     }
 
@@ -196,6 +197,7 @@ pub const Target = enum(c_int) {
             .tab_undoable => i18n._("Terminal sessions in this tab will end unless you undo the close before the timeout."),
             .window => i18n._("All terminal sessions in this window will be terminated."),
             .surface => i18n._("The currently running process in this split will be terminated."),
+            .surface_undoable => i18n._("The process in this split will end unless you undo the close before the timeout."),
         };
     }
 

@@ -2725,8 +2725,8 @@ keybind: Keybinds = .{},
 /// `1h1h` is equivalent to `2h`. This is confusing and should be avoided.
 /// A future update may disallow this.
 ///
-/// On Linux (GTK), this controls how long a closed tab remains undoable,
-/// including when closing the last tab also closes its window. With
+/// On Linux (GTK), this controls how long a closed tab or split remains
+/// undoable, including when closing the last tab also closes its window. With
 /// `gtk-single-instance=true`, reopen Ghostty before the timeout and use
 /// the undo binding to restore the tab. Closing a window itself is not
 /// undoable on GTK.

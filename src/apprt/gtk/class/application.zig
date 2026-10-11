@@ -168,15 +168,37 @@ pub const Application = extern struct {
     };
 
     const Private = struct {
-        const ClosedTab = struct {
-            tab: *Tab,
-            window_id: c_uint,
-            position: c_int,
-            pinned: bool,
+        const ClosedItem = struct {
+            const ClosedTab = struct {
+                tab: *Tab,
+                window_id: c_uint,
+                position: c_int,
+                pinned: bool,
+            };
+
+            const ClosedSplit = struct {
+                surface: *Surface,
+                anchor_id: u64,
+                sibling_end_id: u64,
+                tab_id: u64,
+                window_id: c_uint,
+                tab_position: c_int,
+                pinned: bool,
+                direction: Surface.Tree.Split.Direction,
+                ratio: f16,
+            };
+
+            const Value = union(enum) {
+                tab: ClosedTab,
+                split: ClosedSplit,
+            };
+
+            value: Value,
             expires_at: i64,
         };
 
-        closed_tabs: std.ArrayListUnmanaged(ClosedTab) = .empty,
+        closed_items: std.ArrayListUnmanaged(ClosedItem) = .empty,
+        next_tab_id: u64 = 1,
         undo_timer: ?c_uint = null,
         undo_hold: bool = false,
 
@@ -589,7 +611,7 @@ pub const Application = extern struct {
                 // If we are configured to always stay running, don't quit.
                 const config = priv.config.get();
                 if (!config.@"quit-after-last-window-closed") break :q false;
-                if (priv.closed_tabs.items.len != 0) break :q false;
+                if (priv.closed_items.items.len != 0) break :q false;
 
                 // If the quit timer has expired, quit.
                 if (priv.quit_timer == .expired) {
@@ -864,21 +886,72 @@ pub const Application = extern struct {
     }
 
     pub fn retainClosedTab(self: *Self, window: *Window, page: *adw.TabPage) void {
-        const timeout = self.private().config.get().@"undo-timeout".duration;
-        if (timeout == 0) return;
         const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
-        const duration_us = timeout / std.time.ns_per_us + @intFromBool(timeout % std.time.ns_per_us != 0);
-        self.private().closed_tabs.append(self.allocator(), .{
+        self.retainClosedItem(.{ .tab = .{
             .tab = tab,
             .window_id = window.as(gtk.ApplicationWindow).getId(),
             .position = window.getTabView().getPagePosition(page),
             .pinned = page.getPinned() != 0,
+        } });
+    }
+
+    pub fn undoEnabled(self: *Self) bool {
+        return self.private().config.get().@"undo-timeout".duration > 0;
+    }
+
+    pub fn nextTabId(self: *Self) u64 {
+        const priv = self.private();
+        const id = priv.next_tab_id;
+        priv.next_tab_id += 1;
+        return id;
+    }
+
+    pub fn retainClosedSplit(
+        self: *Self,
+        split_tree: *SplitTree,
+        surface: *Surface,
+        anchor: *Surface,
+        sibling_end: *Surface,
+        direction: Surface.Tree.Split.Direction,
+        ratio: f16,
+    ) void {
+        const tab = ext.getAncestor(Tab, split_tree.as(gtk.Widget)) orelse return;
+        const window = ext.getAncestor(Window, split_tree.as(gtk.Widget)) orelse return;
+        const anchor_core = anchor.core() orelse return;
+        const end_core = sibling_end.core() orelse return;
+        const page = window.getTabView().getPage(tab.as(gtk.Widget));
+        self.retainClosedItem(.{ .split = .{
+            .surface = surface,
+            .anchor_id = anchor_core.id,
+            .sibling_end_id = end_core.id,
+            .tab_id = tab.getId(),
+            .window_id = window.as(gtk.ApplicationWindow).getId(),
+            .tab_position = window.getTabView().getPagePosition(page),
+            .pinned = page.getPinned() != 0,
+            .direction = direction,
+            .ratio = ratio,
+        } });
+    }
+
+    fn retainClosedItem(self: *Self, value: Private.ClosedItem.Value) void {
+        const timeout = self.private().config.get().@"undo-timeout".duration;
+        if (timeout == 0) return;
+        const duration_us = timeout / std.time.ns_per_us + @intFromBool(timeout % std.time.ns_per_us != 0);
+        self.private().closed_items.append(self.allocator(), .{
+            .value = value,
             .expires_at = glib.getMonotonicTime() + @as(i64, @intCast(duration_us)),
         }) catch |err| {
-            log.warn("unable to retain closed tab: {}", .{err});
+            log.warn("unable to retain closed item: {}", .{err});
             return;
         };
-        _ = tab.as(gobject.Object).ref();
+        switch (value) {
+            .tab => |entry| {
+                _ = entry.tab.as(gobject.Object).ref();
+            },
+            .split => |entry| {
+                _ = entry.surface.as(gobject.Object).ref();
+            },
+        }
         if (!self.private().undo_hold) {
             self.as(gio.Application).hold();
             self.private().undo_hold = true;
@@ -886,68 +959,158 @@ pub const Application = extern struct {
         self.scheduleUndoTimer();
     }
 
-    fn undoClosedTab(self: *Self) bool {
-        self.expireClosedTabs();
-        while (self.private().closed_tabs.pop()) |entry| {
-            const live = if (entry.tab.getSurfaceTree()) |tree| !tree.isEmpty() else false;
-            if (!live) {
-                self.releaseClosedTab(entry);
-                continue;
+    fn undoClosedItem(self: *Self) bool {
+        self.expireClosedItems();
+        while (self.private().closed_items.pop()) |entry| {
+            const restored = switch (entry.value) {
+                .tab => |tab| self.restoreClosedTab(tab),
+                .split => |split| self.restoreClosedSplit(split),
+            };
+            self.releaseClosedItem(entry);
+            if (restored) {
+                self.releaseUndoHoldIfEmpty();
+                self.scheduleUndoTimer();
+                return true;
             }
-            const existing = if (self.as(gtk.Application).getWindowById(entry.window_id)) |gtk_window|
-                gobject.ext.cast(Window, gtk_window)
-            else
-                null;
-            const window = existing orelse Window.new(self, .none);
-            if (existing == null) {
-                self.private().requested_window = true;
-                _ = self.as(gobject.Object).bindProperty(
-                    "config",
-                    window.as(gobject.Object),
-                    "config",
-                    .{},
-                );
-            }
-            window.restoreClosedTab(entry.tab, entry.position, entry.pinned);
-            if (existing == null) {
-                if (window.getActiveSurface()) |surface| {
-                    surface.estimateInitialSize();
-                    if (surface.getDefaultSize()) |size| {
-                        window.as(gtk.Window).setDefaultSize(@intCast(size.width), @intCast(size.height));
-                    }
-                }
-            }
-            gtk.Window.present(window.as(gtk.Window));
-            self.releaseClosedTab(entry);
-            self.releaseUndoHoldIfEmpty();
-            self.scheduleUndoTimer();
-            return true;
         }
         self.releaseUndoHoldIfEmpty();
         self.scheduleUndoTimer();
         return false;
     }
 
-    fn releaseClosedTab(_: *Self, entry: Private.ClosedTab) void {
-        entry.tab.as(gobject.Object).unref();
+    fn restoreClosedTab(self: *Self, entry: Private.ClosedItem.ClosedTab) bool {
+        const tree = entry.tab.getSurfaceTree() orelse return false;
+        if (tree.isEmpty()) return false;
+        const restored = self.getRestoreWindow(entry.window_id);
+        restored.window.restoreClosedTab(entry.tab, entry.position, entry.pinned);
+        self.presentRestoredWindow(restored);
+        return true;
     }
 
-    fn expireClosedTabs(self: *Self) void {
+    fn restoreClosedSplit(self: *Self, entry: Private.ClosedItem.ClosedSplit) bool {
+        if (entry.surface.core() == null) return false;
+        const anchor: ?*Surface = if (self.core().findSurfaceByID(entry.anchor_id)) |anchor_core|
+            anchor_core.rt_surface.gobj()
+        else
+            null;
+        const end: ?*Surface = if (self.core().findSurfaceByID(entry.sibling_end_id)) |end_core|
+            end_core.rt_surface.gobj()
+        else
+            null;
+        var node: ?*glib.List = self.as(gtk.Application).getWindows();
+        while (node) |item| : (node = item.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(item.f_data orelse continue));
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+            const tab_view = window.getTabView();
+            for (0..@intCast(tab_view.getNPages())) |index| {
+                const tab = gobject.ext.cast(Tab, tab_view.getNthPage(@intCast(index)).getChild()) orelse continue;
+                if (tab.getId() != entry.tab_id) continue;
+                if (self.restoreClosedSplitInTab(entry, tab, window, anchor, end)) return true;
+            }
+        }
+
+        for ([_]?*Surface{ anchor, end }) |candidate| {
+            const reference = candidate orelse continue;
+            const tab = ext.getAncestor(Tab, reference.as(gtk.Widget)) orelse continue;
+            const window = ext.getAncestor(Window, reference.as(gtk.Widget)) orelse continue;
+            if (self.restoreClosedSplitInTab(entry, tab, window, anchor, end)) return true;
+        }
+
+        const restored = self.getRestoreWindow(entry.window_id);
+        const tab = Tab.newFromSurface(restored.window.getConfig(), entry.surface);
+        restored.window.restoreClosedTab(tab, entry.tab_position, entry.pinned);
+        self.presentRestoredWindow(restored);
+        return true;
+    }
+
+    fn restoreClosedSplitInTab(
+        _: *Self,
+        entry: Private.ClosedItem.ClosedSplit,
+        tab: *Tab,
+        window: *Window,
+        anchor: ?*Surface,
+        end: ?*Surface,
+    ) bool {
+        const tree = tab.getSplitTree();
+        const surface_tree = tree.getTree() orelse return false;
+        const reference = reference: {
+            for ([_]?*Surface{ anchor, end }) |candidate| {
+                const surface = candidate orelse continue;
+                if (surface_tree.locate(surface) != null) break :reference surface;
+            }
+            if (tab.getActiveSurface()) |surface| break :reference surface;
+            var iterator = surface_tree.iterator();
+            break :reference (iterator.next() orelse return false).view;
+        };
+        const tab_view = window.getTabView();
+        tab_view.setSelectedPage(tab_view.getPage(tab.as(gtk.Widget)));
+        const did_restore = tree.restoreClosedSplit(entry.surface, reference, end, entry.direction, entry.ratio) catch |err| {
+            log.warn("unable to restore closed split: {}", .{err});
+            return false;
+        };
+        if (!did_restore) return false;
+        gtk.Window.present(window.as(gtk.Window));
+        return true;
+    }
+
+    const RestoredWindow = struct {
+        window: *Window,
+        created: bool,
+    };
+
+    fn getRestoreWindow(self: *Self, id: c_uint) RestoredWindow {
+        const existing = if (self.as(gtk.Application).getWindowById(id)) |gtk_window|
+            gobject.ext.cast(Window, gtk_window)
+        else
+            null;
+        const window = existing orelse Window.new(self, .none);
+        if (existing == null) {
+            self.private().requested_window = true;
+            _ = self.as(gobject.Object).bindProperty(
+                "config",
+                window.as(gobject.Object),
+                "config",
+                .{},
+            );
+        }
+        return .{ .window = window, .created = existing == null };
+    }
+
+    fn presentRestoredWindow(_: *Self, restored: RestoredWindow) void {
+        if (restored.created) {
+            if (restored.window.getActiveSurface()) |surface| {
+                surface.estimateInitialSize();
+                if (surface.getDefaultSize()) |size| {
+                    restored.window.as(gtk.Window).setDefaultSize(@intCast(size.width), @intCast(size.height));
+                }
+            }
+        }
+        gtk.Window.present(restored.window.as(gtk.Window));
+    }
+
+    fn releaseClosedItem(_: *Self, entry: Private.ClosedItem) void {
+        switch (entry.value) {
+            .tab => |tab| tab.tab.as(gobject.Object).unref(),
+            .split => |split| split.surface.as(gobject.Object).unref(),
+        }
+    }
+
+    fn expireClosedItems(self: *Self) void {
         const now = glib.getMonotonicTime();
         var index: usize = 0;
-        while (index < self.private().closed_tabs.items.len) {
-            if (self.private().closed_tabs.items[index].expires_at > now) {
+        while (index < self.private().closed_items.items.len) {
+            if (self.private().closed_items.items[index].expires_at > now) {
                 index += 1;
                 continue;
             }
-            self.releaseClosedTab(self.private().closed_tabs.orderedRemove(index));
+            self.releaseClosedItem(self.private().closed_items.orderedRemove(index));
         }
         self.releaseUndoHoldIfEmpty();
     }
 
     fn releaseUndoHoldIfEmpty(self: *Self) void {
         const priv = self.private();
-        if (priv.undo_hold and priv.closed_tabs.items.len == 0) {
+        if (priv.undo_hold and priv.closed_items.items.len == 0) {
             priv.undo_hold = false;
             self.as(gio.Application).release();
         }
@@ -959,9 +1122,9 @@ pub const Application = extern struct {
             _ = glib.Source.remove(timer);
             priv.undo_timer = null;
         }
-        for (priv.closed_tabs.items) |entry| self.releaseClosedTab(entry);
-        priv.closed_tabs.deinit(self.allocator());
-        priv.closed_tabs = .empty;
+        for (priv.closed_items.items) |entry| self.releaseClosedItem(entry);
+        priv.closed_items.deinit(self.allocator());
+        priv.closed_items = .empty;
         self.releaseUndoHoldIfEmpty();
     }
 
@@ -972,7 +1135,7 @@ pub const Application = extern struct {
             priv.undo_timer = null;
         }
         var next: ?i64 = null;
-        for (priv.closed_tabs.items) |entry| {
+        for (priv.closed_items.items) |entry| {
             next = if (next) |deadline| @min(deadline, entry.expires_at) else entry.expires_at;
         }
         const deadline = next orelse return;
@@ -987,7 +1150,7 @@ pub const Application = extern struct {
     fn undoTimerExpired(user_data: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(user_data.?));
         self.private().undo_timer = null;
-        self.expireClosedTabs();
+        self.expireClosedItems();
         self.scheduleUndoTimer();
         return 0;
     }
@@ -2279,7 +2442,7 @@ pub const Application = extern struct {
 /// All apprt action handlers
 const Action = struct {
     pub fn undo(_: apprt.Target) bool {
-        return Application.default().undoClosedTab();
+        return Application.default().undoClosedItem();
     }
 
     pub fn closeTab(target: apprt.Target, value: apprt.Action.Value(.close_tab)) bool {
