@@ -869,8 +869,9 @@ pub const Action = union(enum) {
     /// to the next application as determined by the OS.
     ///
     /// Note: When the focused surface is fullscreen, this method does nothing.
+    /// On Linux (GTK), quick-terminal and fullscreen windows remain visible.
     ///
-    /// Only implemented on macOS.
+    /// Implemented on macOS and Linux (GTK).
     toggle_visibility,
 
     /// Toggle the window background opacity between transparent and opaque.

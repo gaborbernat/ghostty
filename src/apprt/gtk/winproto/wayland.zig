@@ -73,7 +73,7 @@ pub const App = struct {
         config: *const Config,
     ) bool {
         const manager = self.globals.get(.vicinae_hotkey_manager) orelse return false;
-        self.hotkeys.bind(manager, shortcuts, config);
+        self.hotkeys.bind(manager, self.globals, shortcuts, config);
         return true;
     }
 

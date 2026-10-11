@@ -109,7 +109,7 @@ pub const GlobalShortcuts = extern struct {
             const impl = gobject.ext.defineSignal(
                 name,
                 Self,
-                &.{*const Binding.Action},
+                &.{ *const Binding.Action, ?[*:0]const u8 },
                 void,
             );
         };
@@ -602,15 +602,20 @@ pub const GlobalShortcuts = extern struct {
         log.debug("activated={s}", .{shortcut_id});
 
         const action = self.private().map.get(std.mem.span(shortcut_id)) orelse return;
-        self.emitTrigger(&action);
+        var options: ?*glib.Variant = null;
+        params.getChild(3, "@a{sv}", &options);
+        defer if (options) |value| value.unref();
+        var activation_token: ?[*:0]const u8 = null;
+        if (options) |value| _ = value.lookup("activation_token", "&s", &activation_token);
+        self.emitTrigger(&action, activation_token);
     }
 
     /// Emit the trigger signal. Public for winproto shortcut backends.
-    pub fn emitTrigger(self: *Self, action: *const Binding.Action) void {
+    pub fn emitTrigger(self: *Self, action: *const Binding.Action, activation_token: ?[*:0]const u8) void {
         signals.trigger.impl.emit(
             self,
             null,
-            .{action},
+            .{ action, activation_token },
             null,
         );
     }
