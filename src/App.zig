@@ -505,6 +505,15 @@ pub fn performAllAction(
     rt_app: *apprt.App,
     action: input.Binding.Action,
 ) !void {
+    if (action == .toggle_background_opacity) {
+        const surface = self.focusedSurface() orelse if (self.surfaces.items.len > 0)
+            self.surfaces.items[0].core()
+        else
+            return;
+        _ = try surface.performBindingAction(action);
+        return;
+    }
+
     switch (action.scope()) {
         // App-scoped actions are handled by the app so that they aren't
         // repeated for each surface (since each surface forwards

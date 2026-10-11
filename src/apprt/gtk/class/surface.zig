@@ -3503,6 +3503,10 @@ pub const Surface = extern struct {
         };
         errdefer surface.deinit();
 
+        if (ext.getAncestor(Window, self.as(gtk.Widget))) |window| if (window.backgroundOpaque()) surface.setBackgroundOpaque(true) catch |err| {
+            log.warn("failed to set background opacity: {}", .{err});
+        };
+
         // Store it!
         priv.core_surface = surface;
 

@@ -114,6 +114,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
+        background_opaque: bool = false,
 
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
@@ -1194,6 +1195,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        pub fn setBackgroundOpaque(self: *Self, enabled: bool) void {
+            if (self.background_opaque == enabled) return;
+            self.background_opaque = enabled;
+            self.markDirty();
+        }
+
+        fn backgroundOpacity(self: *const Self) f64 {
+            return if (self.background_opaque) 1 else self.config.background_opacity;
+        }
+
         /// Release the GPU resources we hold while the surface is not
         /// visible. Today this is the swap chain (render targets, font
         /// atlas texture copies, cell buffers, custom shader textures),
@@ -1647,7 +1658,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.terminal_state.colors.background.r,
                     self.terminal_state.colors.background.g,
                     self.terminal_state.colors.background.b,
-                    @intFromFloat(@round(self.config.background_opacity * 255.0)),
+                    @intFromFloat(@round(self.backgroundOpacity() * 255.0)),
                 };
 
                 // If we're on macOS and have glass styles, we remove
@@ -3180,7 +3191,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // If the user requested to have opacity on all cells, apply it.
                         if (self.config.background_opacity_cells and bg_style != null) {
                             var opacity: f64 = @floatFromInt(default);
-                            opacity *= self.config.background_opacity;
+                            opacity *= self.backgroundOpacity();
                             break :bg_alpha @intFromFloat(opacity);
                         }
 

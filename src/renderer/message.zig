@@ -52,6 +52,8 @@ pub const Message = union(enum) {
         impl: *renderer.Renderer.DerivedConfig,
     },
 
+    background_opaque: bool,
+
     /// Matches for the current viewport from the search thread. These happen
     /// async so they may be off for a frame or two from the actually rendered
     /// viewport. The renderer must handle this gracefully.

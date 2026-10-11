@@ -263,6 +263,7 @@ pub const Window = extern struct {
         ///
         /// For now, this logic is more similar to our legacy GTK side.
         surface_init: bool = false,
+        background_opaque: bool = false,
 
         /// True if the running program requested a resize (see
         /// resizeSurface) that toplevelComputeSize should not override.
@@ -320,6 +321,13 @@ pub const Window = extern struct {
         // If our configuration is null then we get the configuration
         // from the application.
         const priv = self.private();
+        var node: ?*glib.List = Application.default().as(gtk.Application).getWindows();
+        while (node) |item| : (node = item.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(item.f_data orelse continue));
+            const source = gobject.ext.cast(Self, gtk_window) orelse continue;
+            priv.background_opaque = source.backgroundOpaque();
+            break;
+        }
 
         const config = config: {
             if (priv.config) |config| break :config config.get();
@@ -631,6 +639,7 @@ pub const Window = extern struct {
 
         const app = Application.default();
         const window = Window.new(app, .none);
+        window.setBackgroundOpaque(self.backgroundOpaque());
 
         tab_view.transferPage(
             page,
@@ -719,10 +728,7 @@ pub const Window = extern struct {
         const config = if (priv.config) |v| v.get() else return;
 
         // Only add a solid background if we're opaque.
-        self.toggleCssClass(
-            "background",
-            config.@"background-opacity" >= 1,
-        );
+        self.syncBackgroundOpacity();
 
         // Apply class to color headerbar if window-theme is set to `ghostty` and
         // GTK version is before 4.16. The conditional is because above 4.16
@@ -744,6 +750,44 @@ pub const Window = extern struct {
         priv.winproto.syncAppearance() catch |err| {
             log.warn("failed to sync winproto appearance error={}", .{err});
         };
+    }
+
+    pub fn syncBackgroundOpacity(self: *Self) void {
+        const config = if (self.private().config) |value| value.get() else return;
+        self.toggleCssClass(
+            "background",
+            config.@"background-opacity" >= 1 or self.private().background_opaque,
+        );
+    }
+
+    pub fn backgroundOpaque(self: *Self) bool {
+        return self.private().background_opaque;
+    }
+
+    pub fn toggleBackgroundOpacity(self: *Self) bool {
+        const config = if (self.private().config) |value| value.get() else return false;
+        if (config.@"background-opacity" >= 1 or self.as(gtk.Window).isFullscreen() != 0) return false;
+
+        const enabled = !self.private().background_opaque;
+        var node: ?*glib.List = Application.default().as(gtk.Application).getWindows();
+        while (node) |item| : (node = item.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(item.f_data orelse continue));
+            const window = gobject.ext.cast(Self, gtk_window) orelse continue;
+            window.setBackgroundOpaque(enabled);
+        }
+        return true;
+    }
+
+    fn setBackgroundOpaque(self: *Self, enabled: bool) void {
+        const priv = self.private();
+        priv.background_opaque = enabled;
+        for (Application.default().core().surfaces.items) |surface| {
+            if (ext.getAncestor(Self, surface.gobj().as(gtk.Widget)) != self) continue;
+            surface.core().setBackgroundOpaque(enabled) catch |err| {
+                log.warn("failed to update background opacity: {}", .{err});
+            };
+        }
+        self.syncBackgroundOpacity();
     }
 
     /// Sync the state of any actions on this window.
@@ -808,6 +852,9 @@ pub const Window = extern struct {
         var it = tree.iterator();
         while (it.next()) |entry| {
             const surface = entry.view;
+            if (surface.core()) |core| core.setBackgroundOpaque(priv.background_opaque) catch |err| {
+                log.warn("failed to update background opacity: {}", .{err});
+            };
             // Before adding any new signal handlers, disconnect any that we may
             // have added before. Otherwise we may get multiple handlers for the
             // same signal.
@@ -1802,7 +1849,7 @@ pub const Window = extern struct {
 
     fn tabViewCreateWindow(
         _: *adw.TabView,
-        _: *Self,
+        self: *Self,
     ) callconv(.c) *adw.TabView {
         // Create a new window without creating a new tab.
         const win = gobject.ext.newInstance(
@@ -1811,6 +1858,7 @@ pub const Window = extern struct {
                 .application = Application.default(),
             },
         );
+        win.setBackgroundOpaque(self.backgroundOpaque());
 
         // We have to show it otherwise it'll just be hidden.
         gtk.Window.present(win.as(gtk.Window));

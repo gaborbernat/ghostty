@@ -2539,6 +2539,11 @@ fn queueRender(self: *Surface) !void {
     try self.renderer_thread.wakeup.notify();
 }
 
+pub fn setBackgroundOpaque(self: *Surface, enabled: bool) !void {
+    _ = self.renderer_thread.mailbox.push(global.io(), .{ .background_opaque = enabled }, .{ .forever = {} });
+    try self.queueRender();
+}
+
 /// Called by the apprt when the surface's display is realized.
 /// Notifies the renderer so it can begin rendering.
 /// Safe to call from the main thread.
