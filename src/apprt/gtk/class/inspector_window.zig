@@ -8,6 +8,7 @@ const gtk = @import("gtk");
 const gresource = @import("../build/gresource.zig");
 
 const Common = @import("../class.zig").Common;
+const Application = @import("application.zig").Application;
 const Surface = @import("surface.zig").Surface;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const InspectorWidget = @import("inspector_widget.zig").InspectorWidget;
@@ -116,6 +117,7 @@ pub const InspectorWindow = extern struct {
 
     pub fn new(surface: *Surface) *Self {
         return gobject.ext.newInstance(Self, .{
+            .application = Application.default(),
             .surface = surface,
         });
     }

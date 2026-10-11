@@ -33,6 +33,7 @@ pub const Tag = enum {
     kde_decoration_manager,
     kde_slide_manager,
     kde_output_order,
+    seat,
     vicinae_hotkey_manager,
     xdg_activation,
 
@@ -43,6 +44,7 @@ pub const Tag = enum {
             .kde_decoration_manager => org.KdeKwinServerDecorationManager,
             .kde_slide_manager => org.KdeKwinSlideManager,
             .kde_output_order => kde.OutputOrderV1,
+            .seat => wl.Seat,
             .vicinae_hotkey_manager => vicinae.HotkeyManagerV1,
             .xdg_activation => xdg.ActivationV1,
         };
@@ -152,7 +154,7 @@ fn registryListener(
                     const new_proxy = registry.bind(
                         v.name,
                         T,
-                        T.generated_version,
+                        @min(v.version, T.generated_version),
                     ) catch |err| {
                         log.warn(
                             "error binding interface {s} error={}",

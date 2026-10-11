@@ -185,6 +185,9 @@ pub const Application = extern struct {
         /// The global shortcut logic.
         global_shortcuts: *GlobalShortcuts,
 
+        hidden_windows: std.ArrayListUnmanaged(c_uint) = .empty,
+        hidden_active_window: ?c_uint = null,
+
         /// This is set to true so long as we request a window exactly
         /// once. This prevents quitting the app before we've shown one
         /// window.
@@ -459,6 +462,7 @@ pub const Application = extern struct {
         priv.winproto.deinit();
         priv.open_uri.deinit();
         priv.global_shortcuts.unref();
+        priv.hidden_windows.deinit(alloc);
         if (priv.saved_language) |language| alloc.free(language);
         if (gdk.Display.getDefault()) |display| {
             gtk.StyleContext.removeProviderForDisplay(
@@ -790,6 +794,7 @@ pub const Application = extern struct {
             .toggle_maximize => Action.toggleMaximize(target),
             .toggle_fullscreen => Action.toggleFullscreen(target),
             .toggle_quick_terminal => return Action.toggleQuickTerminal(self),
+            .toggle_visibility => return Action.toggleVisibility(self, null),
             .toggle_tab_overview => return Action.toggleTabOverview(target),
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
@@ -807,7 +812,6 @@ pub const Application = extern struct {
             .secure_input,
             .close_all_windows,
             .float_window,
-            .toggle_visibility,
             .toggle_background_opacity,
             .cell_size,
             .render_inspector,
@@ -1551,6 +1555,14 @@ pub const Application = extern struct {
     fn activate(self: *Self) callconv(.c) void {
         log.debug("activate", .{});
 
+        if (Action.restoreHiddenWindows(self, null)) {
+            gio.Application.virtual_methods.activate.call(
+                Class.parent,
+                self.as(Parent),
+            );
+            return;
+        }
+
         // Queue a new window
         const priv = self.private();
         _ = priv.core_app.mailbox.push(global.io(), .{
@@ -1752,8 +1764,13 @@ pub const Application = extern struct {
     fn globalShortcutTrigger(
         _: *GlobalShortcuts,
         action: *const Binding.Action,
+        activation_token: ?[*:0]const u8,
         self: *Self,
     ) callconv(.c) void {
+        if (action.* == .toggle_visibility) {
+            _ = Action.toggleVisibility(self, activation_token);
+            return;
+        }
         self.core().performAllAction(self.rt(), action.*) catch |err| {
             log.warn("failed to perform action={}", .{err});
         };
@@ -2134,6 +2151,72 @@ pub const Application = extern struct {
 
 /// All apprt action handlers
 const Action = struct {
+    pub fn restoreHiddenWindows(app: *Application, activation_token: ?[*:0]const u8) bool {
+        const priv = app.private();
+        const gtk_app = app.as(gtk.Application);
+        if (priv.hidden_windows.items.len == 0) return false;
+
+        var front_window: ?*gtk.Window = null;
+        for (priv.hidden_windows.items) |id| {
+            const window = gtk_app.getWindowById(id) orelse continue;
+            if (front_window == null or priv.hidden_active_window == id) front_window = window;
+        }
+        if (front_window) |window| {
+            if (activation_token) |token| window.setStartupId(token);
+        }
+        for (priv.hidden_windows.items) |id| {
+            const window = gtk_app.getWindowById(id) orelse continue;
+            window.as(gtk.Widget).setVisible(@intFromBool(true));
+        }
+        if (front_window) |window| window.present();
+        priv.hidden_windows.clearRetainingCapacity();
+        priv.hidden_active_window = null;
+        return front_window != null;
+    }
+
+    pub fn toggleVisibility(app: *Application, activation_token: ?[*:0]const u8) bool {
+        const priv = app.private();
+        const gtk_app = app.as(gtk.Application);
+        if (gtk_app.getActiveWindow()) |active| {
+            if (active.isActive() != 0 and active.isFullscreen() != 0) return false;
+        }
+        if (priv.hidden_windows.items.len > 0 and restoreHiddenWindows(app, activation_token)) return true;
+        const active = gtk_app.getActiveWindow() orelse return false;
+        if (active.isActive() == 0) {
+            if (activation_token) |token| active.setStartupId(token);
+            active.present();
+            return true;
+        }
+        const active_window = gobject.ext.cast(gtk.ApplicationWindow, active) orelse return false;
+        if (gobject.ext.cast(Window, active)) |window| {
+            if (window.isQuickTerminal()) return false;
+        }
+        if (active.isFullscreen() != 0) return false;
+
+        const windows = gtk_app.getWindows();
+        var node: ?*glib.List = windows;
+        while (node) |item| : (node = item.f_next) {
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(item.f_data orelse continue));
+            const window = gobject.ext.cast(gtk.ApplicationWindow, gtk_window) orelse continue;
+            if (gobject.ext.cast(Window, gtk_window)) |ghostty_window| {
+                if (ghostty_window.isQuickTerminal()) continue;
+            }
+            if (gtk_window.as(gtk.Widget).isVisible() == 0 or gtk_window.isFullscreen() != 0) continue;
+            priv.hidden_windows.append(app.allocator(), window.getId()) catch |err| {
+                log.warn("unable to hide windows: {}", .{err});
+                priv.hidden_windows.clearRetainingCapacity();
+                return false;
+            };
+        }
+
+        priv.hidden_active_window = active_window.getId();
+        for (priv.hidden_windows.items) |id| {
+            const window = gtk_app.getWindowById(id) orelse continue;
+            window.as(gtk.Widget).setVisible(@intFromBool(false));
+        }
+        return priv.hidden_windows.items.len > 0;
+    }
+
     pub fn closeTab(target: apprt.Target, value: apprt.Action.Value(.close_tab)) bool {
         switch (target) {
             .app => return false,

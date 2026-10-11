@@ -6,9 +6,11 @@ const Allocator = std.mem.Allocator;
 
 const wayland = @import("wayland");
 const vicinae = wayland.client.vicinae;
+const xdg = wayland.client.xdg;
 
 const Config = @import("../../../../config.zig").Config;
 const Binding = @import("../../../../input.zig").Binding;
+const Globals = @import("Globals.zig");
 const key = @import("../../key.zig");
 const GlobalShortcuts = @import("../../class/global_shortcuts.zig").GlobalShortcuts;
 
@@ -24,8 +26,11 @@ const Entry = struct {
     trigger: Binding.Trigger,
     action: Binding.Action,
     shortcuts: *GlobalShortcuts,
+    globals: *Globals,
+    activation_token: ?*xdg.ActivationTokenV1 = null,
 
     fn deinit(self: *Entry) void {
+        if (self.activation_token) |token| token.destroy();
         if (self.hotkey) |hotkey| hotkey.destroy();
     }
 
@@ -95,6 +100,7 @@ pub fn clear(self: *Hotkeys) void {
 pub fn bind(
     self: *Hotkeys,
     manager: *vicinae.HotkeyManagerV1,
+    globals: *Globals,
     shortcuts: *GlobalShortcuts,
     config: *const Config,
 ) void {
@@ -120,6 +126,7 @@ pub fn bind(
             .trigger = entry.key_ptr.*,
             .action = actions[0],
             .shortcuts = shortcuts,
+            .globals = globals,
         }) catch {};
     }
 
@@ -159,7 +166,49 @@ fn hotkeyListener(
             entry.fail(v.message, true);
         },
 
-        .pressed => entry.shortcuts.emitTrigger(&entry.action),
+        .pressed => |pressed| {
+            if (entry.action != .toggle_visibility) {
+                entry.shortcuts.emitTrigger(&entry.action, null);
+                return;
+            }
+            if (entry.activation_token) |previous| {
+                previous.destroy();
+                entry.activation_token = null;
+                entry.shortcuts.emitTrigger(&entry.action, null);
+            }
+            const activation = entry.globals.get(.xdg_activation) orelse {
+                entry.shortcuts.emitTrigger(&entry.action, null);
+                return;
+            };
+            const seat = entry.globals.get(.seat) orelse {
+                entry.shortcuts.emitTrigger(&entry.action, null);
+                return;
+            };
+            const token = activation.getActivationToken() catch |err| {
+                log.warn("unable to request activation token: {}", .{err});
+                entry.shortcuts.emitTrigger(&entry.action, null);
+                return;
+            };
+            entry.activation_token = token;
+            token.setSerial(pressed.serial, seat);
+            token.setListener(*Entry, activationTokenListener, entry);
+            token.commit();
+        },
         .released => {},
+    }
+}
+
+fn activationTokenListener(
+    token: *xdg.ActivationTokenV1,
+    event: xdg.ActivationTokenV1.Event,
+    entry: *Entry,
+) void {
+    if (entry.activation_token != token) return;
+    switch (event) {
+        .done => |done| {
+            entry.activation_token = null;
+            entry.shortcuts.emitTrigger(&entry.action, done.token);
+            token.destroy();
+        },
     }
 }
