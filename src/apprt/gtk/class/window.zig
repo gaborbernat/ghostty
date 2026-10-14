@@ -1650,6 +1650,11 @@ pub const Window = extern struct {
             .{ .sync_create = true },
         );
         tab_view.setSelectedPage(page);
+        // Restored surfaces were initialized before, so their init signal
+        // won't fire again to size a new window.
+        if (tab.getActiveSurface()) |surface| {
+            if (surface.core() != null) surfaceInit(surface, self);
+        }
     }
 
     fn retainClosedTab(self: *Self, page: *adw.TabPage) void {
@@ -1706,10 +1711,7 @@ pub const Window = extern struct {
         }
 
         // Show a confirmation dialog
-        const dialog: *CloseConfirmationDialog = .new(if (self.getConfig()) |config|
-            if (config.get().@"undo-timeout".duration > 0) .tab_undoable else .tab
-        else
-            .tab);
+        const dialog: *CloseConfirmationDialog = .new(.tab);
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
             *adw.TabPage,
